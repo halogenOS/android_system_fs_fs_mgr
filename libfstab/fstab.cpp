@@ -42,6 +42,7 @@
 using android::base::EndsWith;
 using android::base::ParseByteCount;
 using android::base::ParseInt;
+using android::base::ParseUint;
 using android::base::ReadFileToString;
 using android::base::Readlink;
 using android::base::Split;
@@ -346,6 +347,16 @@ bool ParseFsMgrFlags(const std::string& flags, FstabEntry* entry) {
             // It doesn't actually enable metadata encryption; that is done by
             // "keydirectory".
             entry->metadata_encryption_options = arg;
+        } else if (StartsWith(flag, "rawkey_autodetect_length=")) {
+            // When the stored metadata key or system DE key of this entry
+            // has this many bytes, every key of that encryption is a raw key,
+            // even when the encryption options set a hardware-wrapped key type.
+            size_t length;
+            if (!ParseUint(arg, &length) || length == 0) {
+                LERROR << "rawkey_autodetect_length= flag malformed: " << arg;
+                return false;
+            }
+            entry->raw_key_length = length;
         } else if (StartsWith(flag, "sysfs_path=")) {
             // The path to trigger device gc by idle-maint of vold.
             entry->sysfs_path = arg;

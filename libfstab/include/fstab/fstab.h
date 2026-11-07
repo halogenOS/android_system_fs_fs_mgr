@@ -20,6 +20,7 @@
 #include <sys/types.h>
 
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -42,6 +43,7 @@ struct FstabEntry {
     std::string fs_checkpoint_opts;
     std::string metadata_key_dir;
     std::string metadata_encryption_options;
+    std::optional<size_t> raw_key_length;
     off64_t length = 0;
     std::string label;
     int partnum = -1;
