@@ -394,6 +394,11 @@ class SnapshotManager final : public ISnapshotManager {
     // first-stage to decide whether to launch snapuserd.
     bool IsSnapuserdRequired();
 
+    // If true, the pending update needs dm-snapshot devices, which this
+    // version cannot map. An older version wrote such an update, and recovery
+    // has to install it again.
+    bool UpdateNeedsDmSnapshot();
+
     // This is primarily invoked during device reboot after an OTA update.
     //
     // a: Check if the partitions are mounted off snapshots.

@@ -2558,6 +2558,17 @@ std::string SnapshotManager::GetGlobalRollbackIndicatorPath() {
     return kRollbackIndicatorPath;
 }
 
+static bool UpdateStateNeedsSnapshots(UpdateState state) {
+    switch (state) {
+        case UpdateState::Unverified:
+        case UpdateState::Merging:
+        case UpdateState::MergeFailed:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool SnapshotManager::NeedSnapshotsInFirstStageMount() {
     if (IsSnapshotWithoutSlotSwitch()) {
         if (GetCurrentSlot() != Slot::Source) {
@@ -2603,14 +2614,15 @@ bool SnapshotManager::NeedSnapshotsInFirstStageMount() {
         LOG(FATAL) << "Could not read update state to determine snapshot status";
         return false;
     }
-    switch (ReadUpdateState(lock.get())) {
-        case UpdateState::Unverified:
-        case UpdateState::Merging:
-        case UpdateState::MergeFailed:
-            return true;
-        default:
-            return false;
-    }
+    return UpdateStateNeedsSnapshots(ReadUpdateState(lock.get()));
+}
+
+bool SnapshotManager::UpdateNeedsDmSnapshot() {
+    auto lock = LockShared();
+    if (!lock) return false;
+
+    SnapshotUpdateStatus update_status = ReadSnapshotUpdateStatus(lock.get());
+    return UpdateStateNeedsSnapshots(update_status.state()) && !update_status.using_snapuserd();
 }
 
 bool SnapshotManager::CreateLogicalAndSnapshotPartitions(
