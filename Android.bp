@@ -65,6 +65,7 @@ cc_defaults {
     ],
     srcs: [
         "blockdev.cpp",
+        "data_mount_failure.cpp",
         "file_wait.cpp",
         "fs_mgr.cpp",
         "fs_mgr_format.cpp",
@@ -152,6 +153,7 @@ cc_library_static {
     ],
     srcs: [
         "blockdev.cpp",
+        "data_mount_failure.cpp",
         "file_wait.cpp",
         "fs_mgr.cpp",
         "fs_mgr_format.cpp",

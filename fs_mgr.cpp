@@ -1537,10 +1537,16 @@ static FstabEntry* LocateFormattableEntry(FstabEntry* const begin, FstabEntry* c
 
 // When multiple fstab records share the same mount_point, it will try to mount each
 // one in turn, and ignore any duplicates after a first successful mount.
-// Returns -1 on error, and  FS_MGR_MNTALL_* otherwise.
-int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
+// Returns a recovery request when the device needs recovery, FS_MGR_MNTALL_FAIL on any other
+// error, and FS_MGR_MNTALL_* otherwise.
+MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
     int encryptable = FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE;
     int error_count = 0;
+    // Why /data did not mount. Only /data sets it, so the failure of another partition never
+    // replaces it. A mount of /data replayed after a format replaces the cause of the attempt
+    // before the format.
+    std::optional<DataMountFailure> data_mount_failure;
+    bool other_partition_format_failed = false;
     CheckpointManager checkpoint_manager;
     AvbUniquePtr avb_handle(nullptr);
     bool wiped = false;
@@ -1751,7 +1757,11 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
             } else {
                 LERROR << __FUNCTION__ << "(): Format failed. "
                        << "Suggest recovery...";
-                encryptable = FS_MGR_MNTALL_DEV_NEEDS_RECOVERY;
+                if (current_entry.mount_point == "/data") {
+                    data_mount_failure = DataMountFailure::FormatFailed;
+                } else {
+                    other_partition_format_failed = true;
+                }
                 continue;
             }
         }
@@ -1806,7 +1816,9 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
 
     set_type_property(encryptable);
 
-    if (error_count) {
+    if (data_mount_failure || other_partition_format_failed) {
+        return RecoveryRequest{data_mount_failure};
+    } else if (error_count) {
         return FS_MGR_MNTALL_FAIL;
     } else {
         return encryptable;

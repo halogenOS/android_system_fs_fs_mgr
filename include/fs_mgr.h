@@ -24,7 +24,9 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <variant>
 
+#include <fs_mgr/data_mount_failure.h>
 #include <fstab/fstab.h>
 
 // Magic number at start of verity metadata
@@ -55,11 +57,17 @@ enum mount_mode {
 #define FS_MGR_MNTALL_DEV_IS_METADATA_ENCRYPTED     7
 #define FS_MGR_MNTALL_DEV_NEEDS_METADATA_ENCRYPTION 6
 #define FS_MGR_MNTALL_DEV_FILE_ENCRYPTED            5
-#define FS_MGR_MNTALL_DEV_NEEDS_RECOVERY            4
 #define FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE           0
 #define FS_MGR_MNTALL_FAIL                          (-1)
+// fs_mgr_mount_all() asks init to start recovery without a wipe.
+struct RecoveryRequest {
+    // Why /data did not mount, or nothing when only another partition failed to format.
+    std::optional<android::fs_mgr::DataMountFailure> data_mount_failure;
+};
+// One of FS_MGR_MNTALL_*, or a request to start recovery.
+using MountAllResult = std::variant<int, RecoveryRequest>;
 // fs_mgr_mount_all() updates fstab entries that reference device-mapper.
-int fs_mgr_mount_all(android::fs_mgr::Fstab* fstab, int mount_mode);
+MountAllResult fs_mgr_mount_all(android::fs_mgr::Fstab* fstab, int mount_mode);
 
 struct HashtreeInfo {
     // The hash algorithm used to build the merkle tree.
