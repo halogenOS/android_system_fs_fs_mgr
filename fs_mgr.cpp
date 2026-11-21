@@ -36,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <map>
@@ -1504,6 +1505,79 @@ bool WasMetadataEncryptionInterrupted(const FstabEntry& entry) {
     return access(fs_mgr_metadata_encryption_in_progress_file_name(entry).c_str(), R_OK) == 0;
 }
 
+// Returns the entry whose mount point contains `path`, the longest one when mount points nest, or
+// nothing when no entry contains it.
+static const FstabEntry* FindEntryContainingPath(const Fstab& fstab, const std::string& path) {
+    const FstabEntry* found = nullptr;
+    for (const FstabEntry& entry : fstab) {
+        if (StartsWith(path, entry.mount_point + "/") &&
+            (found == nullptr || entry.mount_point.size() > found->mount_point.size())) {
+            found = &entry;
+        }
+    }
+    return found;
+}
+
+enum class MetadataKeyState { kPresent, kAbsent, kUnknown };
+
+// Tells whether the key that vold uses for `entry` exists. vold expects the key in <keydir>/key,
+// or in <keydir>/default/key when the entry spans several devices. The key counts as absent only
+// when both paths do not exist on the mounted partition of the key directory, or when that
+// partition is not mounted and its start looks erased.
+static MetadataKeyState CheckMetadataEncryptionKey(const Fstab& fstab, const FstabEntry& entry) {
+    bool both_paths_absent = true;
+    for (const std::string& path :
+         {entry.metadata_key_dir + "/key", entry.metadata_key_dir + "/default/key"}) {
+        if (access(path.c_str(), F_OK) == 0) return MetadataKeyState::kPresent;
+        both_paths_absent = both_paths_absent && errno == ENOENT;
+    }
+    const FstabEntry* key_holder = FindEntryContainingPath(fstab, entry.metadata_key_dir);
+    if (key_holder == nullptr) return MetadataKeyState::kUnknown;
+    const bool key_proved_absent = IsMountPointMounted(key_holder->mount_point)
+                                           ? both_paths_absent
+                                           : partition_wiped(key_holder->blk_device.c_str());
+    return key_proved_absent ? MetadataKeyState::kAbsent : MetadataKeyState::kUnknown;
+}
+
+// Whether no partition whose key is in `key_holder` contains data that the key decrypts, so that
+// formatting `key_holder` destroys only keys that decrypt nothing. Such a partition looks erased,
+// or contains a plain ext4 or f2fs file system, whose superblock ciphertext never shows.
+static bool KeyedPartitionsContainNoEncryptedData(const Fstab& fstab,
+                                                  const FstabEntry& key_holder) {
+    return std::all_of(fstab.begin(), fstab.end(), [&](const FstabEntry& entry) {
+        const FstabEntry* holder = FindEntryContainingPath(fstab, entry.metadata_key_dir);
+        return holder == nullptr || holder->mount_point != key_holder.mount_point ||
+               partition_wiped(entry.blk_device.c_str()) || fs_mgr_is_ext4(entry.blk_device) ||
+               fs_mgr_is_f2fs(entry.blk_device);
+    });
+}
+
+// Returns why `entry`, which failed to mount, may still contain data that formatting would
+// destroy, or nothing when fs_mgr may format it once it looks erased.
+static std::optional<DataMountFailure> FindReasonNotToFormat(const Fstab& fstab,
+                                                             const FstabEntry& entry) {
+    if (WasMetadataEncryptionInterrupted(entry)) {
+        return DataMountFailure::EncryptionInterrupted;
+    }
+    const bool wiped = partition_wiped(entry.blk_device.c_str());
+    if (!should_use_metadata_encryption(entry)) {
+        if (wiped && !KeyedPartitionsContainNoEncryptedData(fstab, entry)) {
+            return DataMountFailure::KeyMissing;
+        }
+        return std::nullopt;
+    }
+    switch (CheckMetadataEncryptionKey(fstab, entry)) {
+        case MetadataKeyState::kUnknown:
+            return DataMountFailure::KeyDirectoryUnreadable;
+        case MetadataKeyState::kPresent:
+            if (wiped) return DataMountFailure::DataLooksErased;
+            return std::nullopt;
+        case MetadataKeyState::kAbsent:
+            if (wiped && entry.fs_mgr_flags.formattable) return std::nullopt;
+            return DataMountFailure::KeyMissing;
+    }
+}
+
 static FstabEntry* LocateFormattableEntry(FstabEntry* const begin, FstabEntry* const end) {
     if (begin == end) {
         return nullptr;
@@ -1711,26 +1785,40 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                 LocateFormattableEntry(fstab->data() + top_idx, fstab->data() + fstab->size());
         // Mounting failed, understand why and retry.
         wiped = partition_wiped(current_entry.blk_device.c_str());
-        if (mount_errno != EBUSY && mount_errno != EACCES &&
-            current_entry.fs_mgr_flags.formattable && (wiped || encryption_interrupted)) {
+        const bool busy_or_denied = mount_errno == EBUSY || mount_errno == EACCES;
+        const bool is_userdata = current_entry.mount_point == "/data";
+        // Only /data reports a cause. Another partition counts as a mount error unless its entry
+        // is marked nofail.
+        auto report_mount_failure = [&](DataMountFailure failure) {
+            if (is_userdata) {
+                data_mount_failure = failure;
+            } else if (!attempted_entry.fs_mgr_flags.no_fail) {
+                ++error_count;
+            }
+        };
+        if (!busy_or_denied) {
+            if (auto reason = FindReasonNotToFormat(*fstab, current_entry)) {
+                LERROR << __FUNCTION__ << "(): " << realpath(current_entry.blk_device) << " at "
+                       << current_entry.mount_point << " may still contain data, so fs_mgr does "
+                       << "not format it (" << ToRecoveryReason(*reason) << ")";
+                report_mount_failure(*reason);
+                continue;
+            }
+        }
+        if (!busy_or_denied && current_entry.fs_mgr_flags.formattable && wiped) {
             // current_entry and attempted_entry point at the same partition, but sometimes
             // at two different lines in the fstab.  Use current_entry for formatting
             // as that is the preferred one.
-            if (wiped)
-                LERROR << __FUNCTION__ << "(): " << realpath(current_entry.blk_device)
-                       << " is wiped and " << current_entry.mount_point << " "
-                       << current_entry.fs_type << " is formattable. Format it.";
-            if (encryption_interrupted)
-                LERROR << __FUNCTION__ << "(): " << realpath(current_entry.blk_device)
-                       << " was interrupted during encryption and " << current_entry.mount_point
-                       << " " << current_entry.fs_type << " is formattable. Format it.";
+            LERROR << __FUNCTION__ << "(): " << realpath(current_entry.blk_device)
+                   << " is wiped and " << current_entry.mount_point << " "
+                   << current_entry.fs_type << " is formattable. Format it.";
 
             checkpoint_manager.Revert(&current_entry);
 
-            // EncryptInplace will be used when vdc gives an error or needs to format partitions
-            // other than /data
-            if (should_use_metadata_encryption(current_entry) &&
-                current_entry.mount_point == "/data") {
+            // vold formats a metadata-encrypted /data, and fs_mgr formats every other partition.
+            // A failed vold format leaves /data as it is, since formatting it here would leave it
+            // without encryption.
+            if (should_use_metadata_encryption(current_entry) && is_userdata) {
                 // vdc->Format requires "ro.crypto.type" to set an encryption flag
                 encryptable = FS_MGR_MNTALL_DEV_IS_METADATA_ENCRYPTED;
                 set_type_property(encryptable);
@@ -1744,10 +1832,11 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                                android::base::Join(formattable_entry->device_aliased, ' ')},
                               nullptr)) {
                     LERROR << "Encryption failed";
+                    data_mount_failure = DataMountFailure::FormatFailed;
                 } else {
                     userdata_mounted = true;
-                    continue;
                 }
+                continue;
             }
 
             if (fs_mgr_do_format(*formattable_entry) == 0) {
@@ -1757,7 +1846,7 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
             } else {
                 LERROR << __FUNCTION__ << "(): Format failed. "
                        << "Suggest recovery...";
-                if (current_entry.mount_point == "/data") {
+                if (is_userdata) {
                     data_mount_failure = DataMountFailure::FormatFailed;
                 } else {
                     other_partition_format_failed = true;
@@ -1767,15 +1856,17 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
         }
 
         // mount(2) returned an error, handle the encryptable/formattable case.
-        if (mount_errno != EBUSY && mount_errno != EACCES && !encryption_interrupted &&
-            should_use_metadata_encryption(attempted_entry)) {
+        if (!busy_or_denied && should_use_metadata_encryption(attempted_entry)) {
             if (!call_vdc({"cryptfs", "mountFstab", attempted_entry.blk_device,
                            attempted_entry.mount_point,
                            current_entry.fs_mgr_flags.is_zoned ? "true" : "false",
                            android::base::Join(current_entry.user_devices, ' ')},
                           nullptr)) {
-                ++error_count;
-            } else if (current_entry.mount_point == "/data") {
+                report_mount_failure(DataMountFailure::KeyUnusable);
+            } else if (!IsMountPointMounted(attempted_entry.mount_point)) {
+                // mountFstab succeeds once the key is set up, whether or not the mount does.
+                report_mount_failure(DataMountFailure::FilesystemUnreadable);
+            } else if (is_userdata) {
                 userdata_mounted = true;
             }
             encryptable = FS_MGR_MNTALL_DEV_IS_METADATA_ENCRYPTED;
